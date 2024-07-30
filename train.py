@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import logging
 
 import numpy as np
 import torch
@@ -72,11 +73,25 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+torch_profile = False
+jax_profile = False
+profile_enabled = torch_profile or jax_profile
+torch_profiler_out_prefix = '/scratch/hwu27/'
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+logging.basicConfig(
+        format='I%(asctime)s %(levelname)-8s %(message)s',
+        level=logging.INFO,
+        datefmt='%m%d %H:%M:%S')
+
+if torch_profile:
+    logging.info('torch profiler enabled!')
+else:
+    logging.info('torch profiler disabled!')
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -216,6 +231,11 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
+    if torch_profile:
+        from torch.profiler import profile, record_function, ProfilerActivity
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True)
+    if profile_enabled:
+        prof.__enter__()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
@@ -223,7 +243,22 @@ def estimate_loss():
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
+            if split == 'train':
+                logging.info(f"[{k}] global_step={k}")
+            elif split == 'val':
+                logging.info(f"[{k + eval_iters}] global_step={k + eval_iters}")
         out[split] = losses.mean()
+    if profile_enabled:
+        prof.__exit__(None, None, None)
+    if torch_profile:
+        import datetime
+        formatted_now = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        json_filename = f"nanoGPT_{formatted_now}_torch_profiler.json"
+        if not os.path.exists(torch_profiler_out_prefix):
+            os.makedirs(torch_profiler_out_prefix, exist_ok=True)
+        json_path = os.path.join(torch_profiler_out_prefix, json_filename)
+        logging.info(f'Output to {json_path}.')
+        prof.export_chrome_trace(json_path)
     model.train()
     return out
 
@@ -263,27 +298,6 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
